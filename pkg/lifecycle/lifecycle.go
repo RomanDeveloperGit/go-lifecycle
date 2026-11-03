@@ -67,13 +67,20 @@ func (l *Lifecycle) AddComponent(name string, component Component) error {
 	return nil
 }
 
+func (l *Lifecycle) makeResponse(ctx context.Context, reports reportSlice) ([]report, error) {
+	// если контекст отменен после успешного запуска всех - не отдаем ошибку
+	if reports.err() == nil && ctx.Err() != nil {
+		return reports, nil
+	}
+
+	return reports, errors.Join(ctx.Err(), reports.err())
+}
+
 func (l *Lifecycle) Startup(ctx context.Context) ([]report, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if !l.sealed {
-		l.sealed = true
-	}
+	l.sealed = true
 
 	reports := make(reportSlice, 0, len(l.components))
 
@@ -92,16 +99,14 @@ func (l *Lifecycle) Startup(ctx context.Context) ([]report, error) {
 		}
 	}
 
-	return reports, errors.Join(ctx.Err(), reports.err())
+	return l.makeResponse(ctx, reports)
 }
 
 func (l *Lifecycle) Shutdown(ctx context.Context) ([]report, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if !l.sealed {
-		l.sealed = true
-	}
+	l.sealed = true
 
 	reports := make(reportSlice, 0, len(l.components))
 
@@ -129,5 +134,6 @@ func (l *Lifecycle) Shutdown(ctx context.Context) ([]report, error) {
 		}
 	}
 
-	return reports, errors.Join(ctx.Err(), reports.err())
+	return l.makeResponse(ctx, reports)
+
 }
