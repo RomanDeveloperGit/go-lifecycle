@@ -3,70 +3,129 @@ package lifecycle_test
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/RomanDeveloperGit/go-lifecycle/pkg/lifecycle"
 )
 
-type TestComponent struct {
+// fakeComponent - тестовый компонент, который фиксирует вызовы и умеет возвращать заданные ошибки.
+type fakeComponent struct {
+	name   string
+	events *[]string // общий журнал вызовов, чтобы проверять реальный порядок, а не только порядок отчетов
+
 	startupCalls  int
 	shutdownCalls int
-	startupErr    error
-	shutdownErr   error
+
+	startupErr  error
+	shutdownErr error
+
+	// Если true, то Startup/Shutdown блокируются до отмены контекста
+	blockOnStartup  bool
+	blockOnShutdown bool
 }
 
-func (c *TestComponent) assertStartupCalled(t *testing.T, n int) {
-	t.Helper()
-	if c.startupCalls != n {
-		t.Errorf("startupCalls = %d, want %d", c.startupCalls, n)
-	}
-}
-
-func (c *TestComponent) assertShutdownCalled(t *testing.T, n int) {
-	t.Helper()
-	if c.shutdownCalls != n {
-		t.Errorf("shutdownCalls = %d, want %d", c.shutdownCalls, n)
-	}
-}
-
-func (c *TestComponent) Startup(ctx context.Context) error {
-	done := make(chan struct{}, 1)
-
-	go func() {
-		time.Sleep(time.Millisecond * 250)
-		close(done)
-	}()
-
+func (c *fakeComponent) Startup(ctx context.Context) error {
 	c.startupCalls++
+	c.record("startup")
 
-	select {
-	case <-ctx.Done():
+	if c.blockOnStartup {
+		<-ctx.Done()
 		return ctx.Err()
-	case <-done:
-		return c.startupErr
+	}
+
+	return c.startupErr
+}
+
+func (c *fakeComponent) Shutdown(ctx context.Context) error {
+	c.shutdownCalls++
+	c.record("shutdown")
+
+	if c.blockOnShutdown {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	return c.shutdownErr
+}
+
+func (c *fakeComponent) record(op string) {
+	if c.events != nil {
+		*c.events = append(*c.events, op+":"+c.name)
 	}
 }
 
-func (c *TestComponent) Shutdown(ctx context.Context) error {
-	done := make(chan struct{}, 1)
+func (c *fakeComponent) assertStartupCalled(t *testing.T, n int) {
+	t.Helper()
 
-	go func() {
-		time.Sleep(time.Millisecond * 500)
-		close(done)
-	}()
+	if c.startupCalls != n {
+		t.Errorf("%s: startupCalls = %d, want %d", c.name, c.startupCalls, n)
+	}
+}
 
-	c.shutdownCalls++
+func (c *fakeComponent) assertShutdownCalled(t *testing.T, n int) {
+	t.Helper()
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		return c.shutdownErr
+	if c.shutdownCalls != n {
+		t.Errorf("%s: shutdownCalls = %d, want %d", c.name, c.shutdownCalls, n)
+	}
+}
+
+// fixture - Lifecycle с тремя зарегистрированными компонентами в порядке PostgreSQL -> Kafka -> Redis.
+type fixture struct {
+	lifecycle *lifecycle.Lifecycle
+	events    *[]string
+
+	postgres *fakeComponent
+	kafka    *fakeComponent
+	redis    *fakeComponent
+}
+
+func (f *fixture) all() []*fakeComponent {
+	return []*fakeComponent{f.postgres, f.kafka, f.redis}
+}
+
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+
+	events := &[]string{}
+
+	f := &fixture{
+		lifecycle: lifecycle.New(),
+		events:    events,
+		postgres:  &fakeComponent{name: "PostgreSQL", events: events},
+		kafka:     &fakeComponent{name: "Kafka", events: events},
+		redis:     &fakeComponent{name: "Redis", events: events},
+	}
+
+	for _, c := range f.all() {
+		mustAddComponent(t, f.lifecycle, c.name, c)
+	}
+
+	return f
+}
+
+func mustAddComponent(t *testing.T, l *lifecycle.Lifecycle, name string, c lifecycle.Component) {
+	t.Helper()
+
+	if err := l.AddComponent(name, c); err != nil {
+		t.Fatalf("AddComponent(%q) error = %v, want nil", name, err)
+	}
+}
+
+func assertEvents(t *testing.T, got, want []string) {
+	t.Helper()
+
+	if !slices.Equal(got, want) {
+		t.Errorf("events = %v, want %v", got, want)
 	}
 }
 
 func TestAddComponent(t *testing.T) {
+	t.Parallel()
+
 	type input struct {
 		name      string
 		component lifecycle.Component
@@ -74,95 +133,120 @@ func TestAddComponent(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		setup func(l *lifecycle.Lifecycle)
+		setup func(t *testing.T, l *lifecycle.Lifecycle)
 		input input
 		want  error
 	}{
 		{
-			"success",
-			nil,
-			input{"PostgreSQL", &TestComponent{}},
-			nil,
+			name:  "success",
+			input: input{"PostgreSQL", &fakeComponent{}},
+			want:  nil,
 		},
 		{
-			"empty name",
-			nil,
-			input{"", &TestComponent{}},
-			lifecycle.ErrComponentNameIsEmpty,
+			name:  "empty name",
+			input: input{"", &fakeComponent{}},
+			want:  lifecycle.ErrComponentNameIsEmpty,
 		},
 		{
-			"nil component",
-			nil,
-			input{"Kafka", nil},
-			lifecycle.ErrComponentIsNil,
+			name:  "nil component",
+			input: input{"Kafka", nil},
+			want:  lifecycle.ErrComponentIsNil,
 		},
 		{
-			"duplicate component name",
-			func(l *lifecycle.Lifecycle) {
-				l.AddComponent("Redis", &TestComponent{})
+			name: "duplicate component name",
+			setup: func(t *testing.T, l *lifecycle.Lifecycle) {
+				mustAddComponent(t, l, "Redis", &fakeComponent{})
 			},
-			input{"Redis", &TestComponent{}},
-			lifecycle.ErrComponentNameAlreadyExists,
+			input: input{"Redis", &fakeComponent{}},
+			want:  lifecycle.ErrComponentNameAlreadyExists,
 		},
 		{
-			"add after startup",
-			func(l *lifecycle.Lifecycle) {
-				l.Startup(context.Background())
+			name: "add after startup",
+			setup: func(t *testing.T, l *lifecycle.Lifecycle) {
+				_, _ = l.Startup(context.Background())
 			},
-			input{"ClickHouse", &TestComponent{}},
-			lifecycle.ErrLifecycleIsSealed,
+			input: input{"ClickHouse", &fakeComponent{}},
+			want:  lifecycle.ErrLifecycleIsSealed,
 		},
 		{
-			"add after shutdown",
-			func(l *lifecycle.Lifecycle) {
-				l.Shutdown(context.Background())
+			name: "add after shutdown",
+			setup: func(t *testing.T, l *lifecycle.Lifecycle) {
+				_, _ = l.Shutdown(context.Background())
 			},
-			input{"RabbitMQ", &TestComponent{}},
-			lifecycle.ErrLifecycleIsSealed,
+			input: input{"RabbitMQ", &fakeComponent{}},
+			want:  lifecycle.ErrLifecycleIsSealed,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			l := lifecycle.New()
 
 			if tt.setup != nil {
-				tt.setup(l)
+				tt.setup(t, l)
 			}
 
 			got := l.AddComponent(tt.input.name, tt.input.component)
 
 			if !errors.Is(got, tt.want) {
-				t.Fatalf("got err=%v, want err=%v", got, tt.want)
+				t.Fatalf("AddComponent() error = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func CreateMocksAndLifecycle() (map[string]*TestComponent, *lifecycle.Lifecycle) {
-	mocks := map[string]*TestComponent{
-		"PostgreSQL": {},
-		"Kafka":      {},
-		"Redis":      {},
-	}
+func TestAddComponent_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	const n = 50
 
 	l := lifecycle.New()
-	l.AddComponent("PostgreSQL", mocks["PostgreSQL"])
-	l.AddComponent("Kafka", mocks["Kafka"])
-	l.AddComponent("Redis", mocks["Redis"])
+	errs := make([]error, n)
 
-	return mocks, l
-}
+	var wg sync.WaitGroup
 
-func TestStartup(t *testing.T) {
-	mocks, l := CreateMocksAndLifecycle()
+	for i := range n {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			// Имена уникальны, поэтому все добавления должны пройти успешно
+			errs[i] = l.AddComponent(string(rune('A'+i)), &fakeComponent{})
+		}()
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("AddComponent() #%d error = %v, want nil", i, err)
+		}
+	}
 
 	reports, err := l.Startup(context.Background())
 	if err != nil {
 		t.Fatalf("Startup() error = %v, want nil", err)
 	}
 
-	// При старте компоненты должны быть в FILO порядке
+	if len(reports) != n {
+		t.Fatalf("len(reports) = %d, want %d", len(reports), n)
+	}
+}
+
+func TestStartup(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+
+	reports, err := f.lifecycle.Startup(context.Background())
+	if err != nil {
+		t.Fatalf("Startup() error = %v, want nil", err)
+	}
+
+	// При старте компоненты запускаются в порядке регистрации (FIFO)
 	wantOrder := []string{"PostgreSQL", "Kafka", "Redis"}
 
 	if len(reports) != len(wantOrder) {
@@ -175,102 +259,130 @@ func TestStartup(t *testing.T) {
 		}
 	}
 
-	for _, mock := range mocks {
-		mock.assertStartupCalled(t, 1)
+	assertEvents(t, *f.events, []string{"startup:PostgreSQL", "startup:Kafka", "startup:Redis"})
+
+	for _, c := range f.all() {
+		c.assertStartupCalled(t, 1)
+		c.assertShutdownCalled(t, 0)
 	}
 }
 
 func TestStartup_WithErrors(t *testing.T) {
-	mocks, l := CreateMocksAndLifecycle()
+	t.Parallel()
+
+	f := newFixture(t)
 
 	pgErr := errors.New("PostgreSQL startup error")
 	redisErr := errors.New("Redis startup error")
 
-	mocks["PostgreSQL"].startupErr = pgErr
-	mocks["Redis"].startupErr = redisErr
+	f.postgres.startupErr = pgErr
+	f.redis.startupErr = redisErr
 
-	reports, err := l.Startup(context.Background())
+	reports, err := f.lifecycle.Startup(context.Background())
 
-	if len(reports) != len(mocks) {
-		t.Fatalf("len(reports) = %d, want %d", len(reports), len(mocks))
-	}
-
-	commonErr := errors.Join(pgErr, redisErr)
-
-	if err == nil {
-		t.Fatalf("Startup() error = nil, want %v", commonErr)
+	if len(reports) != len(f.all()) {
+		t.Fatalf("len(reports) = %d, want %d", len(reports), len(f.all()))
 	}
 
 	if !errors.Is(err, pgErr) || !errors.Is(err, redisErr) {
-		t.Fatalf("Startup() error = %v, want %v", err, commonErr)
+		t.Fatalf("Startup() error = %v, want joined %v and %v", err, pgErr, redisErr)
+	}
+
+	// Ошибка одного компонента не должна останавливать запуск остальных
+	for _, c := range f.all() {
+		c.assertStartupCalled(t, 1)
+	}
+
+	if !errors.Is(reports[0].Err, pgErr) {
+		t.Errorf("reports[0].Err = %v, want %v", reports[0].Err, pgErr)
+	}
+
+	if reports[1].Err != nil {
+		t.Errorf("reports[1].Err = %v, want nil", reports[1].Err)
+	}
+
+	if !errors.Is(reports[2].Err, redisErr) {
+		t.Errorf("reports[2].Err = %v, want %v", reports[2].Err, redisErr)
 	}
 }
 
 func TestStartup_WithContextCancel(t *testing.T) {
-	mocks, l := CreateMocksAndLifecycle()
+	t.Parallel()
+
+	f := newFixture(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	reports, err := l.Startup(ctx)
+	reports, err := f.lifecycle.Startup(ctx)
 
-	if len(reports) != len(mocks) {
-		t.Fatalf("len(reports) = %d, want %d", len(reports), len(mocks))
-	}
-
-	if err == nil {
-		t.Fatalf("Startup() error = nil, want context canceled")
+	if len(reports) != len(f.all()) {
+		t.Fatalf("len(reports) = %d, want %d", len(reports), len(f.all()))
 	}
 
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Startup() error = %v, want context canceled", err)
+		t.Fatalf("Startup() error = %v, want %v", err, context.Canceled)
+	}
+
+	// Контекст отменен до старта, поэтому все компоненты должны быть пропущены
+	for i, r := range reports {
+		if !errors.Is(r.Err, context.Canceled) {
+			t.Errorf("reports[%d].Err = %v, want %v", i, r.Err, context.Canceled)
+		}
+	}
+
+	for _, c := range f.all() {
+		c.assertStartupCalled(t, 0)
 	}
 }
 
 func TestStartup_WithContextTimeout(t *testing.T) {
-	mocks, l := CreateMocksAndLifecycle()
+	t.Parallel()
 
-	// успеет запуститься только PostgreSQL, Kafka прервется на половине, а Redis скипнется
-	ctx, cancel := context.WithTimeout(context.Background(), 375*time.Millisecond)
+	f := newFixture(t)
+
+	// PostgreSQL стартует мгновенно, Kafka зависает до дедлайна, а Redis будет пропущен
+	f.kafka.blockOnStartup = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	reports, err := l.Startup(ctx)
+	reports, err := f.lifecycle.Startup(ctx)
 
-	if len(reports) != len(mocks) {
-		t.Fatalf("len(reports) = %d, want %d", len(reports), len(mocks))
-	}
-
-	if err == nil {
-		t.Fatalf("Startup() error = nil, want context timeout")
+	if len(reports) != len(f.all()) {
+		t.Fatalf("len(reports) = %d, want %d", len(reports), len(f.all()))
 	}
 
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Startup() error = %v, want context timeout", err)
+		t.Fatalf("Startup() error = %v, want %v", err, context.DeadlineExceeded)
 	}
 
 	if reports[0].Err != nil {
-		t.Fatalf("reports[0].Error = %v, want nil", reports[0].Err)
+		t.Errorf("reports[0].Err = %v, want nil", reports[0].Err)
 	}
+
+	for _, i := range []int{1, 2} {
+		if !errors.Is(reports[i].Err, context.DeadlineExceeded) {
+			t.Errorf("reports[%d].Err = %v, want %v", i, reports[i].Err, context.DeadlineExceeded)
+		}
+	}
+
+	f.postgres.assertStartupCalled(t, 1)
+	f.kafka.assertStartupCalled(t, 1)
+	f.redis.assertStartupCalled(t, 0)
 }
 
 func TestShutdown(t *testing.T) {
-	mocks := map[string]*TestComponent{
-		"PostgreSQL": {},
-		"Kafka":      {},
-		"Redis":      {},
-	}
+	t.Parallel()
 
-	l := lifecycle.New()
-	l.AddComponent("PostgreSQL", mocks["PostgreSQL"])
-	l.AddComponent("Kafka", mocks["Kafka"])
-	l.AddComponent("Redis", mocks["Redis"])
+	f := newFixture(t)
 
-	reports, err := l.Shutdown(context.Background())
+	reports, err := f.lifecycle.Shutdown(context.Background())
 	if err != nil {
 		t.Fatalf("Shutdown() error = %v, want nil", err)
 	}
 
-	// При стопе компоненты должны быть в LIFO порядке
+	// При остановке компоненты останавливаются в обратном порядке (LIFO)
 	wantOrder := []string{"Redis", "Kafka", "PostgreSQL"}
 
 	if len(reports) != len(wantOrder) {
@@ -283,76 +395,115 @@ func TestShutdown(t *testing.T) {
 		}
 	}
 
-	for _, mock := range mocks {
-		mock.assertShutdownCalled(t, 1)
+	assertEvents(t, *f.events, []string{"shutdown:Redis", "shutdown:Kafka", "shutdown:PostgreSQL"})
+
+	for _, c := range f.all() {
+		c.assertStartupCalled(t, 0)
+		c.assertShutdownCalled(t, 1)
 	}
 }
 
 func TestShutdown_WithErrors(t *testing.T) {
-	mocks, l := CreateMocksAndLifecycle()
+	t.Parallel()
+
+	f := newFixture(t)
 
 	pgErr := errors.New("PostgreSQL shutdown error")
 	redisErr := errors.New("Redis shutdown error")
 
-	mocks["PostgreSQL"].shutdownErr = pgErr
-	mocks["Redis"].shutdownErr = redisErr
+	f.postgres.shutdownErr = pgErr
+	f.redis.shutdownErr = redisErr
 
-	reports, err := l.Shutdown(context.Background())
+	reports, err := f.lifecycle.Shutdown(context.Background())
 
-	if len(reports) != len(mocks) {
-		t.Fatalf("len(reports) = %d, want %d", len(reports), len(mocks))
-	}
-
-	commonErr := errors.Join(pgErr, redisErr)
-
-	if err == nil {
-		t.Fatalf("Shutdown() error = nil, want %v", commonErr)
+	if len(reports) != len(f.all()) {
+		t.Fatalf("len(reports) = %d, want %d", len(reports), len(f.all()))
 	}
 
 	if !errors.Is(err, pgErr) || !errors.Is(err, redisErr) {
-		t.Fatalf("Shutdown() error = %v, want %v", err, commonErr)
+		t.Fatalf("Shutdown() error = %v, want joined %v and %v", err, pgErr, redisErr)
+	}
+
+	// Ошибка одного компонента не должна мешать остановке остальных
+	for _, c := range f.all() {
+		c.assertShutdownCalled(t, 1)
+	}
+
+	// Порядок отчетов обратный: Redis, Kafka, PostgreSQL
+	if !errors.Is(reports[0].Err, redisErr) {
+		t.Errorf("reports[0].Err = %v, want %v", reports[0].Err, redisErr)
+	}
+
+	if reports[1].Err != nil {
+		t.Errorf("reports[1].Err = %v, want nil", reports[1].Err)
+	}
+
+	if !errors.Is(reports[2].Err, pgErr) {
+		t.Errorf("reports[2].Err = %v, want %v", reports[2].Err, pgErr)
 	}
 }
 
 func TestShutdown_WithContextCancel(t *testing.T) {
-	mocks, l := CreateMocksAndLifecycle()
+	t.Parallel()
+
+	f := newFixture(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	reports, err := l.Shutdown(ctx)
+	reports, err := f.lifecycle.Shutdown(ctx)
 
-	if len(reports) != len(mocks) {
-		t.Fatalf("len(reports) = %d, want %d", len(reports), len(mocks))
-	}
-
-	if err == nil {
-		t.Fatalf("Shutdown() error = nil, want context canceled")
+	if len(reports) != len(f.all()) {
+		t.Fatalf("len(reports) = %d, want %d", len(reports), len(f.all()))
 	}
 
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Shutdown() error = %v, want context canceled", err)
+		t.Fatalf("Shutdown() error = %v, want %v", err, context.Canceled)
+	}
+
+	for i, r := range reports {
+		if !errors.Is(r.Err, context.Canceled) {
+			t.Errorf("reports[%d].Err = %v, want %v", i, r.Err, context.Canceled)
+		}
+	}
+
+	for _, c := range f.all() {
+		c.assertShutdownCalled(t, 0)
 	}
 }
 
 func TestShutdown_WithContextTimeout(t *testing.T) {
-	mocks, l := CreateMocksAndLifecycle()
+	t.Parallel()
 
-	// успеет остановиться только PostgreSQL, Kafka прервется на половине, а Redis скипнется
-	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	f := newFixture(t)
+
+	// Redis останавливается первым и мгновенно, Kafka зависает до дедлайна, а PostgreSQL будет пропущен
+	f.kafka.blockOnShutdown = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	reports, err := l.Shutdown(ctx)
+	reports, err := f.lifecycle.Shutdown(ctx)
 
-	if len(reports) != len(mocks) {
-		t.Fatalf("len(reports) = %d, want %d", len(reports), len(mocks))
-	}
-
-	if err == nil {
-		t.Fatalf("Shutdown() error = nil, want context timeout")
+	if len(reports) != len(f.all()) {
+		t.Fatalf("len(reports) = %d, want %d", len(reports), len(f.all()))
 	}
 
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Shutdown() error = %v, want context timeout", err)
+		t.Fatalf("Shutdown() error = %v, want %v", err, context.DeadlineExceeded)
 	}
+
+	if reports[0].Err != nil {
+		t.Errorf("reports[0].Err = %v, want nil", reports[0].Err)
+	}
+
+	for _, i := range []int{1, 2} {
+		if !errors.Is(reports[i].Err, context.DeadlineExceeded) {
+			t.Errorf("reports[%d].Err = %v, want %v", i, reports[i].Err, context.DeadlineExceeded)
+		}
+	}
+
+	f.redis.assertShutdownCalled(t, 1)
+	f.kafka.assertShutdownCalled(t, 1)
+	f.postgres.assertShutdownCalled(t, 0)
 }
