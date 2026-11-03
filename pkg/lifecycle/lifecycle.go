@@ -63,7 +63,7 @@ func (l *Lifecycle) AddComponent(name string, component Component) error {
 	}
 
 	l.components = append(l.components, newComponent(name, component.Startup, component.Shutdown))
- 
+
 	return nil
 }
 
@@ -85,7 +85,10 @@ func (l *Lifecycle) Startup(ctx context.Context) ([]report, error) {
 			beforeStartupTime := time.Now()
 			err := c.startup(ctx)
 
-			reports = append(reports, newReport(c.name, phaseStartup, time.Since(beforeStartupTime), false, err))
+			reports = append(
+				reports,
+				newReport(c.name, phaseStartup, time.Since(beforeStartupTime), false, err),
+			)
 		}
 	}
 
@@ -105,12 +108,24 @@ func (l *Lifecycle) Shutdown(ctx context.Context) ([]report, error) {
 	for i := len(l.components) - 1; i >= 0; i-- {
 		select {
 		case <-ctx.Done():
-			reports = append(reports, newReport(l.components[i].name, phaseShutdown, 0, true, ctx.Err()))
+			reports = append(
+				reports,
+				newReport(l.components[i].name, phaseShutdown, 0, true, ctx.Err()),
+			)
 		default:
 			beforeShutdownTime := time.Now()
 			err := l.components[i].shutdown(ctx)
 
-			reports = append(reports, newReport(l.components[i].name, phaseShutdown, time.Since(beforeShutdownTime), false, err))
+			reports = append(
+				reports,
+				newReport(
+					l.components[i].name,
+					phaseShutdown,
+					time.Since(beforeShutdownTime),
+					false,
+					err,
+				),
+			)
 		}
 	}
 

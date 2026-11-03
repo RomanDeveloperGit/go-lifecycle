@@ -12,7 +12,7 @@ type component struct {
 	shutdownFn phaseFn
 }
 
-func newComponent(name string, startupFn phaseFn, shutdownFn phaseFn) *component {
+func newComponent(name string, startupFn, shutdownFn phaseFn) *component {
 	return &component{
 		name:       name,
 		startupFn:  startupFn,

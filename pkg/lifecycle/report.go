@@ -21,7 +21,13 @@ type report struct {
 	Err           error
 }
 
-func newReport(componentName string, phase phase, duration time.Duration, skipped bool, err error) report {
+func newReport(
+	componentName string,
+	phase phase,
+	duration time.Duration,
+	skipped bool,
+	err error,
+) report {
 	return report{
 		ComponentName: componentName,
 		Phase:         phase,
