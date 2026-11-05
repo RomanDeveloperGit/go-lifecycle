@@ -25,11 +25,18 @@ type fakeComponent struct {
 	// Если true, то Startup/Shutdown блокируются до отмены контекста
 	blockOnStartup  bool
 	blockOnShutdown bool
+
+	panicOnStartup  bool
+	panicOnShutdown bool
 }
 
 func (c *fakeComponent) Startup(ctx context.Context) error {
 	c.startupCalls++
 	c.record("startup")
+
+	if c.panicOnStartup {
+		panic("panic on startup")
+	}
 
 	if c.blockOnStartup {
 		<-ctx.Done()
@@ -42,6 +49,10 @@ func (c *fakeComponent) Startup(ctx context.Context) error {
 func (c *fakeComponent) Shutdown(ctx context.Context) error {
 	c.shutdownCalls++
 	c.record("shutdown")
+
+	if c.panicOnShutdown {
+		panic("panic on shutdown")
+	}
 
 	if c.blockOnShutdown {
 		<-ctx.Done()
@@ -372,6 +383,22 @@ func TestStartup_WithContextTimeout(t *testing.T) {
 	f.redis.assertStartupCalled(t, 0)
 }
 
+func TestStartup_PanicRecovery(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+
+	f.postgres.panicOnStartup = true
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Startup() panicked: %v", r)
+		}
+	}()
+
+	_, _ = f.lifecycle.Startup(context.Background())
+}
+
 func TestShutdown(t *testing.T) {
 	t.Parallel()
 
@@ -506,4 +533,20 @@ func TestShutdown_WithContextTimeout(t *testing.T) {
 	f.redis.assertShutdownCalled(t, 1)
 	f.kafka.assertShutdownCalled(t, 1)
 	f.postgres.assertShutdownCalled(t, 0)
+}
+
+func TestShutdown_PanicRecovery(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+
+	f.redis.panicOnShutdown = true
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Shutdown() panicked: %v", r)
+		}
+	}()
+
+	_, _ = f.lifecycle.Shutdown(context.Background())
 }

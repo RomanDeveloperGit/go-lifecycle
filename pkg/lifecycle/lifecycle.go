@@ -90,11 +90,21 @@ func (l *Lifecycle) Startup(ctx context.Context) ([]report, error) {
 			reports = append(reports, newReport(c.name, phaseStartup, 0, true, ctx.Err()))
 		default:
 			beforeStartupTime := time.Now()
-			err := c.startup(ctx)
+			err := make(chan error)
+
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err <- fmt.Errorf("panic recovered: %v", r)
+					}
+				}()
+
+				err <- c.startup(ctx)
+			}()
 
 			reports = append(
 				reports,
-				newReport(c.name, phaseStartup, time.Since(beforeStartupTime), false, err),
+				newReport(c.name, phaseStartup, time.Since(beforeStartupTime), false, <-err),
 			)
 		}
 	}
@@ -119,7 +129,17 @@ func (l *Lifecycle) Shutdown(ctx context.Context) ([]report, error) {
 			)
 		default:
 			beforeShutdownTime := time.Now()
-			err := l.components[i].shutdown(ctx)
+			err := make(chan error)
+
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err <- fmt.Errorf("panic recovered: %v", r)
+					}
+				}()
+
+				err <- l.components[i].shutdown(ctx)
+			}()
 
 			reports = append(
 				reports,
@@ -128,12 +148,11 @@ func (l *Lifecycle) Shutdown(ctx context.Context) ([]report, error) {
 					phaseShutdown,
 					time.Since(beforeShutdownTime),
 					false,
-					err,
+					<-err,
 				),
 			)
 		}
 	}
 
 	return l.makeResponse(ctx, reports)
-
 }
